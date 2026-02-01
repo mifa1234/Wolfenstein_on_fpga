@@ -1,0 +1,10 @@
+
+
+OPTION psf_version = 2.1;
+
+BEGIN DRIVER key_driver_pb
+	OPTION supported_peripherals = (key_driver_pb);
+	OPTION copyfiles = all;
+	OPTION VERSION = 1.0;
+	OPTION NAME = key_driver_pb;
+END DRIVER

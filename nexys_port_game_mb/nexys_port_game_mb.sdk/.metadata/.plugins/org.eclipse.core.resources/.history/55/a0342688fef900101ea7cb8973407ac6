@@ -1,0 +1,1348 @@
+// ID_CA.C
+
+// this has been customized for WOLF
+
+/*
+=============================================================================
+
+Id Software Caching Manager
+
+=============================================================================
+*/
+
+#define __MICROBLAZE__
+
+#include <sys/types.h>
+#if defined _WIN32
+    #include <io.h>
+#elif defined _arch_dreamcast || defined __MICROBLAZE__
+    #include <unistd.h>
+#else
+    #include <sys/uio.h>
+    #include <unistd.h>
+#endif
+
+#include "wl_def.h"
+#include "xparameters.h"
+#include "xil_io.h"
+
+#define THREEBYTEGRSTARTS
+
+/*
+=============================================================================
+
+                             LOCAL CONSTANTS
+
+=============================================================================
+*/
+
+typedef struct
+{
+    word bit0,bit1;       // 0-255 is a character, > is a pointer to a node
+} huffnode;
+
+
+typedef struct
+{
+    word RLEWtag;
+#if MAPPLANES >= 4
+    word numplanes;       // unused, but WDC needs 2 bytes here for internal usage
+#endif
+    int32_t headeroffsets[NUMMAPS];
+} mapfiletype;
+
+
+/*
+=============================================================================
+
+                             GLOBAL VARIABLES
+
+=============================================================================
+*/
+
+word    *mapsegs[MAPPLANES];
+maptype *mapheaderseg[NUMMAPS];
+byte    *audiosegs[NUMSNDCHUNKS];
+byte    *grsegs[NUMCHUNKS];
+
+mapfiletype *tinf;
+
+/*
+=============================================================================
+
+                             LOCAL VARIABLES
+
+=============================================================================
+*/
+
+char extension[5]; // Need a string, not constant to change cache files
+char graphext[5];
+char audioext[5];
+static const char gheadname[] = "vgahead.";
+static const char gfilename[] = "vgagraph.";
+static const char gdictname[] = "vgadict.";
+static const char mheadname[] = "maphead.";
+#ifdef CARMACIZED
+static const char mfilename[] = "gamemaps.";
+#else
+static const char mfilename[] = "maptemp.";
+#endif
+static const char aheadname[] = "audiohed.";
+static const char afilename[] = "audiot.";
+
+static int32_t  grstarts[NUMCHUNKS + 1];
+static int32_t* audiostarts; // array of offsets in audio / audiot
+
+#ifdef GRHEADERLINKED
+huffnode *grhuffman;
+#else
+huffnode grhuffman[255];
+#endif
+
+FILE   *audiofile;
+
+int32_t   chunkcomplen,chunkexplen;
+
+byte   oldsoundmode;
+
+//
+//void print_hufftree(huffnode *hufftable, int node_index, int depth) {
+//	// Защита от бесконечной рекурсии (на всякий случай)
+//	    if (depth > 50) {
+//	        for (int i = 0; i < depth; i++) printf("  ");
+//	        printf("... (max depth reached)\n\r");
+//	        return;
+//	    }
+//
+//	    for (int i = 0; i < depth; i++) printf("  ");
+//
+//	    printf("Node %d: ", node_index);
+//
+//	    // Bit0 ветвь
+//	    if (hufftable[node_index].bit0 < 256) {
+//	        printf("0.SYM(%d) ", hufftable[node_index].bit0);
+//	    } else {
+//	        printf("0.NODE(%d) ", hufftable[node_index].bit0 - 256);
+//	    }
+//
+//	    // Bit1 ветвь
+//	    if (hufftable[node_index].bit1 < 256) {
+//	        printf("1.SYM(%d)", hufftable[node_index].bit1);
+//	    } else {
+//	        printf("1.NODE(%d)", hufftable[node_index].bit1 - 256);
+//	    }
+//
+//	    printf("\n\r");
+//
+//	    // Рекурсивно обходим дочерние узлы (только если это узлы, а не символы)
+//	    if (hufftable[node_index].bit0 >= 256) {
+//	        print_hufftree(hufftable, hufftable[node_index].bit0 - 256, depth + 1);
+//	    }
+//	    if (hufftable[node_index].bit1 >= 256) {
+//	        print_hufftree(hufftable, hufftable[node_index].bit1 - 256, depth + 1);
+//	    }
+//}
+
+static int32_t GRFILEPOS(const size_t idx)
+{
+	assert(idx < lengthof(grstarts));
+	return grstarts[idx];
+}
+
+/*
+=============================================================================
+
+                            LOW LEVEL ROUTINES
+
+=============================================================================
+*/
+
+/*
+============================
+=
+= CAL_GetGrChunkLength
+=
+= Gets the length of an explicit length chunk (not tiles)
+= The file pointer is positioned so the compressed data can be read in next.
+=
+============================
+*/
+
+void CAL_GetGrChunkLength (FILE *grfile, int chunk)
+{
+    fseek (grfile,GRFILEPOS(chunk),SEEK_SET);
+    fread (&chunkexplen,sizeof(chunkexplen),1,grfile);
+    chunkcomplen = GRFILEPOS(chunk+1)-GRFILEPOS(chunk)-4;
+}
+
+
+/*
+==========================
+=
+= CA_WriteFile
+=
+= Writes a file from a memory buffer
+=
+==========================
+*/
+
+void CA_WriteFile (const char *filename, void *ptr, int32_t length)
+{
+    FILE *file;
+
+    file = fopen(filename,"wb");
+
+    if (!file)
+        CA_CannotOpen (filename);
+
+    if (!fwrite(ptr,length,1,file))
+        Quit ("Error writing file %s: %s",filename,strerror(errno));
+
+    fclose (file);
+}
+
+
+
+/*
+==========================
+=
+= CA_LoadFile
+=
+= Allocate space for and load a file
+=
+==========================
+*/
+
+void CA_LoadFile (const char *filename, void **ptr)
+{
+    FILE   *file;
+    size_t size;
+
+    file = fopen(filename,"rb");
+
+    if (!file)
+        CA_CannotOpen (filename);
+
+    fseek (file,0,SEEK_END);
+    size = ftell(file);
+    fseek (file,0,SEEK_SET);
+
+    *ptr = SafeMalloc(size);
+
+    if (!fread(*ptr,size,1,file))
+        Quit ("Error reading file %s: %s",filename,strerror(errno));
+
+    fclose (file);
+}
+
+
+/*
+============================================================================
+
+                COMPRESSION routines, see JHUFF.C for more
+
+============================================================================
+*/
+
+static void CAL_HuffExpand(byte *source, byte *dest, int32_t length, huffnode *hufftable)
+{
+
+	uint32_t cnt_iter = 0;
+
+	xil_printf("\t\t[%s:%d]  inside CAL_HuffExpand. THIS FUNCTION need OPTimization!!! letter\n\r", __FILE__, __LINE__);
+	byte *end;
+    huffnode *headptr, *huffptr;
+
+    if(!length || !dest)
+    {
+        Quit("length or dest is null!");
+        return;
+    }
+
+    headptr = hufftable+254;        // head node is always node 254
+
+    int written = 0;
+
+    end=dest+length;
+
+    byte val = *source++;
+    byte mask = 1;
+    word nodeval;
+    huffptr = headptr;
+
+
+    int cnt_step = 0, next_step = 0;
+
+    xil_printf("\t\t[%s:%d]  while(1) end=dest+length(%d): %d (%x)\n\r", __FILE__, __LINE__, length, end, end);
+    while(1)
+    {
+    	cnt_iter++;
+
+    	if(next_step == written) {  //if((cnt_iter&0x1FF) == 0) {
+    		xil_printf(" %d/%d, ", written, length);
+    		cnt_step++;
+    		next_step = (cnt_step*length)/5;
+    	} else if(written > 140) {
+    		//xil_printf(" %d/%d, ", written, length);
+    	}
+
+        if(!(val & mask))
+            nodeval = huffptr->bit0;
+        else
+            nodeval = huffptr->bit1;
+
+        //xil_printf(".");
+        if(mask==0x80)
+        {
+            val = *source++;
+            mask = 1;
+        }
+        else mask <<= 1;
+
+        //xil_printf(".");
+        if(nodeval<256)
+        {
+        	//xil_printf(",");
+            *dest++ = (byte) nodeval;
+            written++;
+            huffptr = headptr;
+            if(dest>=end) break;
+        }
+        else
+        {
+        	//xil_printf("|");
+            huffptr = hufftable + (nodeval - 256);
+        }
+
+        //xil_printf("_ ");
+    }
+    xil_printf("\n\r");
+}
+
+
+//static void CAL_HuffExpand_opt(byte *source, byte *dest, int32_t length, huffnode *hufftable)
+//{
+//    // ==================== ПРЕДОБРАБОТКА: Расширенная таблица декодирования ====================
+//    struct decode_entry {
+//        uint8_t symbol;
+//        uint8_t bits_used;
+//        uint8_t valid;
+//        uint8_t next_table; // Для кодов длиннее 8 бит
+//    } table[256];
+//
+//    // Инициализируем таблицу
+//    for (int i = 0; i < 256; i++) {
+//        table[i].valid = 0;
+//        table[i].next_table = 0;
+//    }
+//
+//    // Заполняем таблицу для всех 8-битных комбинаций
+//    for (int window = 0; window < 256; window++) {
+//        huffnode *current = hufftable + 254;
+//        uint8_t temp_window = window;
+//
+//        for (int bits_used = 1; bits_used <= 8; bits_used++) {
+//            uint8_t bit = (temp_window >> (bits_used - 1)) & 1;
+//            uint16_t nodeval = bit ? current->bit1 : current->bit0;
+//
+//            if (nodeval < 256) {
+//                table[window].symbol = (uint8_t)nodeval;
+//                table[window].bits_used = bits_used;
+//                table[window].valid = 1;
+//                break;
+//            } else {
+//                current = hufftable + (nodeval - 256);
+//                // Если достигли 8 бит и все еще в узле, помечаем для продолжения
+//                if (bits_used == 8) {
+//                    table[window].valid = 2; // Нужен второй проход
+//                    table[window].bits_used = 8;
+//                    // Здесь можно сохранить состояние для продолжения
+//                }
+//            }
+//        }
+//    }
+//    // ==================== КОНЕЦ ПРЕДОБРАБОТКИ ====================
+//
+//    // ==================== ОСНОВНОЙ АЛГОРИТМ ====================
+//    if(!length || !dest) {
+//        Quit("length or dest is null!");
+//        return;
+//    }
+//
+//    byte *end = dest + length;
+//    uint32_t bit_buffer = 0;
+//    int bit_count = 0;
+//    int source_index = 0;
+//
+//    while(dest < end) {
+//        // Догружаем данные в битовый буфер
+//        while (bit_count <= 24 && source_index < length) {
+//            bit_buffer |= ((uint32_t)source[source_index]) << bit_count;
+//            bit_count += 8;
+//            source_index++;
+//        }
+//
+//        uint8_t window = bit_buffer & 0xFF;
+//
+//        if (table[window].valid == 1) {
+//            // БЫСТРЫЙ ПУТЬ: символ найден в таблице
+//            *dest++ = table[window].symbol;
+//            bit_buffer >>= table[window].bits_used;
+//            bit_count -= table[window].bits_used;
+//        } else {
+//            // СУПЕР-БЫСТРЫЙ ПУТЬ: используем inline оригинальный алгоритм
+//            // но с оптимизацией регистров и минимизацией ветвлений
+//            huffnode *current = hufftable + 254;
+//            uint32_t local_buffer = bit_buffer;
+//            int local_bits = bit_count;
+//            int bits_used = 0;
+//
+//            while (bits_used < 16) { // Ограничиваем глубину для стабильности
+//                uint8_t bit = local_buffer & 1;
+//                local_buffer >>= 1;
+//                bits_used++;
+//                local_bits--;
+//
+//                uint16_t nodeval = bit ? current->bit1 : current->bit0;
+//
+//                if (nodeval < 256) {
+//                    *dest++ = (byte)nodeval;
+//                    break;
+//                } else {
+//                    current = hufftable + (nodeval - 256);
+//                }
+//
+//                // Если буфер почти пуст, догружаем
+//                if (local_bits < 8 && source_index < length) {
+//                    local_buffer |= ((uint32_t)source[source_index]) << local_bits;
+//                    local_bits += 8;
+//                    source_index++;
+//                }
+//            }
+//
+//            // Обновляем глобальный буфер
+//            bit_buffer = local_buffer;
+//            bit_count = local_bits;
+//        }
+//    }
+//}
+/*
+======================
+=
+= CAL_CarmackExpand
+=
+= Length is the length of the EXPANDED data
+=
+======================
+*/
+
+#define NEARTAG 0xa7
+#define FARTAG  0xa8
+
+void CAL_CarmackExpand (byte *source, word *dest, int length)
+{
+    word ch,chhigh,count,offset;
+    byte *inptr;
+    word *copyptr, *outptr;
+
+    length/=2;
+
+    inptr = (byte *) source;
+    outptr = dest;
+
+    while (length>0)
+    {
+        ch = ReadShort(inptr);
+        inptr += 2;
+        chhigh = ch>>8;
+        if (chhigh == NEARTAG)
+        {
+            count = ch&0xff;
+            if (!count)
+            {                               // have to insert a word containing the tag byte
+                ch |= *inptr++;
+                *outptr++ = ch;
+                length--;
+            }
+            else
+            {
+                offset = *inptr++;
+                copyptr = outptr - offset;
+                length -= count;
+                if(length<0) return;
+                while (count--)
+                    *outptr++ = *copyptr++;
+            }
+        }
+        else if (chhigh == FARTAG)
+        {
+            count = ch&0xff;
+            if (!count)
+            {                               // have to insert a word containing the tag byte
+                ch |= *inptr++;
+                *outptr++ = ch;
+                length --;
+            }
+            else
+            {
+                offset = ReadShort(inptr);
+                inptr += 2;
+                copyptr = dest + offset;
+                length -= count;
+                if(length<0) return;
+                while (count--)
+                    *outptr++ = *copyptr++;
+            }
+        }
+        else
+        {
+            *outptr++ = ch;
+            length --;
+        }
+    }
+}
+
+/*
+======================
+=
+= CA_RLEWcompress
+=
+======================
+*/
+
+int32_t CA_RLEWCompress (word *source, int32_t length, word *dest, word rlewtag)
+{
+    word value,count;
+    unsigned i;
+    word *start,*end;
+
+    start = dest;
+
+    end = source + (length+1)/2;
+
+    //
+    // compress it
+    //
+    do
+    {
+        count = 1;
+        value = *source++;
+        while (*source == value && source<end)
+        {
+            count++;
+            source++;
+        }
+        if (count>3 || value == rlewtag)
+        {
+            //
+            // send a tag / count / value string
+            //
+            *dest++ = rlewtag;
+            *dest++ = count;
+            *dest++ = value;
+        }
+        else
+        {
+            //
+            // send word without compressing
+            //
+            for (i=1;i<=count;i++)
+                *dest++ = value;
+        }
+
+    } while (source<end);
+
+    return (int32_t)(2*(dest-start));
+}
+
+
+/*
+======================
+=
+= CA_RLEWexpand
+= length is EXPANDED length
+=
+======================
+*/
+
+void CA_RLEWexpand (word *source, word *dest, int32_t length, word rlewtag)
+{
+    word value,count,i;
+    word *end=dest+length/2;
+
+//
+// expand it
+//
+    do
+    {
+        value = *source++;
+        if (value != rlewtag)
+            //
+            // uncompressed
+            //
+            *dest++=value;
+        else
+        {
+            //
+            // compressed string
+            //
+            count = *source++;
+            value = *source++;
+            for (i=1;i<=count;i++)
+                *dest++ = value;
+        }
+    } while (dest<end);
+}
+
+
+
+/*
+=============================================================================
+
+                                         CACHE MANAGER ROUTINES
+
+=============================================================================
+*/
+
+
+/*
+======================
+=
+= CAL_SetupGrFile
+=
+======================
+*/
+
+#include "vgadict_wl6.h"
+#include "vgahead_wl6.h"
+#include "vgagraph_wl6.h"
+
+extern const uint8_t VGADICT_WL6[];
+extern const uint8_t VGAHEAD_WL6[];
+extern const uint8_t VGAGRAPH_WL6[];
+
+void CAL_SetupGrFile (void)
+{
+    char fname[13];
+    FILE *file;
+    byte *compseg;
+
+//
+// load ???dict.ext (huffman dictionary for graphics files)
+//
+    snprintf (fname,sizeof(fname),"%s%s",gdictname,extension);
+
+    xil_printf("[%s:%d]  open file %s\n\r", __FILE__, __LINE__, fname);
+//    file = fopen(fname,"rb");
+    file = fmemopen(VGADICT_WL6, VGADICT_WL6_SIZE, "rb");
+
+    if (!file)
+        CA_CannotOpen (fname);
+    else
+    	xil_printf("file open %s OK!!\n\r", fname);
+
+    fread (grhuffman,sizeof(grhuffman),1,file);
+    fclose (file);
+
+//
+// load the data offsets from ???head.ext
+//
+    snprintf (fname,sizeof(fname),"%s%s",gheadname,extension);
+
+//    file = fopen(fname,"rb");
+    file = fmemopen(VGAHEAD_WL6, VGAHEAD_WL6_SIZE, "rb");
+
+    if (!file)
+        CA_CannotOpen (fname);
+    else
+    	xil_printf("file open %s OK!!\n\r", fname);
+
+    fseek (file,0,SEEK_END);
+    int32_t headersize = ftell(file);
+    fseek (file,0,SEEK_SET);
+
+	int expectedsize = lengthof(grstarts);
+
+	xil_printf("headersize: %d,  expectedsize: %d \n\r",headersize, expectedsize);
+
+    if(!param_ignorenumchunks && headersize / 3 != expectedsize)
+        Quit("Wolf4SDL was not compiled for these data files:\n"
+            "%s contains a wrong number of offsets (%i instead of %i)!\n\n"
+            "Please check whether you are using the right executable!\n"
+            "(For mod developers: perhaps you forgot to update NUMCHUNKS?)",
+            fname, headersize / 3, expectedsize);
+
+    byte data[lengthof(grstarts) * 3];
+    fread (data,sizeof(data),1,file);
+    fclose (file);
+
+    byte *d = data;
+    int32_t* i;
+    xil_printf("[%s:%d]  for (i = grstarts; i != endof(grstarts); ++i)\n\r", __FILE__, __LINE__);
+    for (i = grstarts; i != endof(grstarts); ++i)
+    {
+        int32_t val = d[0] | (d[1] << 8) | (d[2] << 16);
+        *i = (val == 0x00FFFFFF ? -1 : val);
+        d += 3;
+    }
+
+//
+// Open the graphics file
+//
+    snprintf (fname,sizeof(fname),"%s%s",gfilename,extension);
+
+//    file = fopen(fname,"rb");
+    file = fmemopen(VGAGRAPH_WL6, VGAGRAPH_WL6_SIZE, "rb");
+
+    if (!file)
+        CA_CannotOpen (fname);
+    else
+		xil_printf("file open %s OK!!\n\r", fname);
+
+//
+// load the pic and sprite headers into the arrays in the data segment
+//
+//    xil_printf("\t[%s:%d]  PRINT topology Huff: \n\r", __FILE__, __LINE__);
+//    print_hufftree(grhuffman, 254, 0);
+
+    if(XIL_PRINTF_EN == 1) xil_printf("\t[%s:%d]  load the pic... \n\r", __FILE__, __LINE__);
+    pictable = SafeMalloc(NUMPICS * sizeof(*pictable));
+    CAL_GetGrChunkLength (file,STRUCTPIC);                // position file pointer
+    if(XIL_PRINTF_EN == 1) xil_printf("\t[%s:%d]  chunkcomplen: %d \n\r", __FILE__, __LINE__, chunkcomplen);
+    compseg = SafeMalloc(chunkcomplen);
+    fread (compseg,chunkcomplen,1,file); //
+
+	uint32_t start_time;
+	uint32_t end_time;
+
+
+//    xil_printf("\t[%s:%d]  to CAL_HuffExpand_opt() \n\r", __FILE__, __LINE__);
+//    Xil_Out32(XPAR_ANY_REG_SPACE_TIMER_BASEADDR,0);
+//    start_time = Xil_In32(XPAR_ANY_REG_SPACE_TIMER_BASEADDR);
+//    CAL_HuffExpand_opt(compseg, (byte*)pictable, NUMPICS * sizeof(*pictable), grhuffman);
+//    end_time = Xil_In32(XPAR_ANY_REG_SPACE_TIMER_BASEADDR);
+//    xil_printf("\n\r\t\t  WORK_TIME: %d \n\r", end_time - start_time);
+
+
+    if(XIL_PRINTF_EN == 1) xil_printf("\t[%s:%d]  to CAL_HuffExpand() \n\r", __FILE__, __LINE__);
+    Xil_Out32(XPAR_ANY_REG_SPACE_TIMER_BASEADDR,0);
+    start_time = Xil_In32(XPAR_ANY_REG_SPACE_TIMER_BASEADDR);
+	CAL_HuffExpand(compseg, (byte*)pictable, NUMPICS * sizeof(*pictable), grhuffman);
+	end_time = Xil_In32(XPAR_ANY_REG_SPACE_TIMER_BASEADDR);
+	if(XIL_PRINTF_EN == 1) xil_printf("\n\r\t\t  WORK_TIME: %d \n\r", end_time - start_time);
+	if(XIL_PRINTF_EN == 1) xil_printf("\t[%s:%d]  END CAL_HuffExpand and STOP WORK!!!!! NEED restart\n\r", __FILE__, __LINE__);
+
+
+    free(compseg);
+
+    if(XIL_PRINTF_EN == 1) xil_printf("\t[%s:%d]  CA_CacheGrChunks (file); \n\r", __FILE__, __LINE__);
+    CA_CacheGrChunks (file);
+
+    fclose (file);
+}
+
+//==========================================================================
+
+
+/*
+======================
+=
+= CAL_SetupMapFile
+=
+======================
+*/
+
+#include "maphead_wl6.h"
+#include "gamemaps_wl6.h"
+
+//это файл для игры
+extern const uint8_t MAPHEAD_WL6[];
+extern const uint8_t GAMEMAPS_WL6[];
+
+void CAL_SetupMapFile (void)
+{
+    int     i;
+    int32_t pos;
+    FILE *file;
+    char fname[13];
+
+//
+// load maphead.ext (offsets and tileinfo for map file)
+//
+    if(XIL_PRINTF_EN == 1) xil_printf("\t- [%s:%d] in CAL_SetupMapFile (file); \n\r", __FILE__, __LINE__);
+
+    snprintf (fname,sizeof(fname),"%s%s",mheadname,extension);
+
+
+//    file = fopen(fname,"rb");
+    file = fmemopen(MAPHEAD_WL6, MAPHEAD_WL6_SIZE, "rb");
+
+    if (!file)
+        CA_CannotOpen (fname);
+    else
+    	xil_printf("open file %s OK!!\n\r", fname);
+
+    tinf = SafeMalloc(sizeof(*tinf));
+
+    fread (tinf,sizeof(*tinf),1,file);
+    fclose (file);
+
+//
+// open the data file
+//
+    snprintf (fname,sizeof(fname),"%s%s",mfilename,extension);
+
+//    file = fopen(fname,"rb");
+    file = fmemopen(GAMEMAPS_WL6, GAMEMAPS_WL6_SIZE, "rb");
+
+    if (!file){
+    	if(XIL_PRINTF_EN == 1) xil_printf("try open file %s", fname);
+        CA_CannotOpen (fname);
+    }else{
+    	xil_printf("open file %s OK!!\n\r", fname);
+    }
+
+//
+// load all map header
+//
+    if(XIL_PRINTF_EN == 1) xil_printf("NUMMAPS %d\n\r", NUMMAPS);
+    for (i=0;i<NUMMAPS;i++)
+    {
+    	if(i%0x0f == 0) xil_printf("iter %d \n\r", i);
+        pos = tinf->headeroffsets[i];
+        if (pos<0)                          // $FFFFFFFF start is a sparse map
+            continue;
+
+        mapheaderseg[i] = SafeMalloc(sizeof(*mapheaderseg[i]));
+
+        fseek (file,pos,SEEK_SET);
+        fread (mapheaderseg[i],sizeof(*mapheaderseg[i]),1,file);
+    }
+
+    fclose (file);
+
+//
+// allocate space for 3 64*64 planes
+//
+    if(XIL_PRINTF_EN == 1) xil_printf("MAPPLANES %d\n\r", MAPPLANES);
+    for (i=0;i<MAPPLANES;i++){
+    	if(i%0x0f == 0) if(XIL_PRINTF_EN == 1) xil_printf("iter %d \n\r", i);
+        mapsegs[i] = SafeMalloc(MAPAREA * sizeof(*mapsegs[i]));
+    }
+}
+
+
+//==========================================================================
+
+
+/*
+======================
+=
+= CAL_SetupAudioFile
+=
+======================
+*/
+
+void CAL_SetupAudioFile (void)
+{
+
+
+	if(XIL_PRINTF_EN == 1) xil_printf("[%s:%d]  open audio file  \n\r", __FILE__, __LINE__);
+	if(XIL_PRINTF_EN == 1) xil_printf("audio BY_PASS!!! \n\r");
+	return;
+
+
+    char fname[13];
+
+//
+// load audiohed.ext (offsets for audio file)
+//
+    snprintf (fname,sizeof(fname),"%s%s",aheadname,extension);
+
+    CA_LoadFile (fname,(void **)&audiostarts);
+
+//
+// open the data file
+//
+    snprintf (fname,sizeof(fname),"%s%s",afilename,extension);
+
+    audiofile = fopen(fname,"rb");
+
+    if (!audiofile)
+        CA_CannotOpen (fname);
+}
+
+//==========================================================================
+
+
+/*
+======================
+=
+= CA_Startup
+=
+= Open all files and load in headers
+=
+======================
+*/
+
+void CA_Startup (void)
+{
+	if(XIL_PRINTF_EN == 1) xil_printf("\t [%s:%d] in CA_Startup (file); \n\r", __FILE__, __LINE__);
+	if(XIL_PRINTF_EN == 1) xil_printf("\t\t CAL_SetupMapFile ();\n\r");
+	CAL_SetupMapFile ();
+	if(XIL_PRINTF_EN == 1) xil_printf("\t\t CAL_SetupGrFile ();\n\r");
+    CAL_SetupGrFile ();
+    if(XIL_PRINTF_EN == 1) xil_printf("\t\t CAL_SetupAudioFile ();\n\r");
+    CAL_SetupAudioFile ();
+}
+
+//==========================================================================
+
+
+/*
+======================
+=
+= CA_Shutdown
+=
+= Closes all files
+=
+======================
+*/
+
+void CA_Shutdown (void)
+{
+    int i,start;
+
+    if (audiofile)
+        fclose (audiofile);
+
+    for (i=0; i<NUMCHUNKS; i++)
+    {
+        free (grsegs[i]);
+        grsegs[i] = NULL;
+    }
+
+    free (pictable);
+    pictable = NULL;
+
+    for (i = 0; i < NUMMAPS; i++)
+    {
+        free (mapheaderseg[i]);
+        mapheaderseg[i] = NULL;
+    }
+
+    for (i = 0; i < MAPPLANES; i++)
+    {
+        free (mapsegs[i]);
+        mapsegs[i] = NULL;
+    }
+
+    free (tinf);
+    tinf = NULL;
+
+    switch(oldsoundmode)
+    {
+        case sdm_Off:
+            return;
+        case sdm_PC:
+            start = STARTPCSOUNDS;
+            break;
+        case sdm_AdLib:
+            start = STARTADLIBSOUNDS;
+            break;
+    }
+
+    for(i=0; i<NUMSOUNDS; i++,start++)
+        UNCACHEAUDIOCHUNK(start);
+}
+
+//===========================================================================
+
+/*
+======================
+=
+= CA_CacheAudioChunk
+=
+======================
+*/
+
+int32_t CA_CacheAudioChunk (int chunk)
+{
+	if(XIL_PRINTF_EN == 1) xil_printf("[%s:%d] in CA_CacheAudioChunk", __FILE__, __LINE__);
+    int32_t pos = audiostarts[chunk];
+    int32_t size = audiostarts[chunk+1]-pos;
+
+    if (audiosegs[chunk])
+        return size;                        // already in memory
+
+    audiosegs[chunk] = SafeMalloc(size);
+
+    fseek (audiofile,pos,SEEK_SET);
+    fread (audiosegs[chunk],size,1,audiofile);
+
+    return size;
+}
+
+void CA_CacheAdlibSoundChunk (int chunk)
+{
+    byte    *bufferseg;
+    byte    *ptr;
+    int32_t pos = audiostarts[chunk];
+    int32_t size = audiostarts[chunk+1]-pos;
+
+    if (audiosegs[chunk])
+        return;                        // already in memory
+
+    fseek (audiofile,pos,SEEK_SET);
+
+    bufferseg = SafeMalloc(ORIG_ADLIBSOUND_SIZE - 1);
+    ptr = bufferseg;
+
+    fread (ptr,ORIG_ADLIBSOUND_SIZE - 1,1,audiofile);   // without data[1]
+
+    AdLibSound *sound = SafeMalloc(size + sizeof(*sound) - ORIG_ADLIBSOUND_SIZE);
+
+    sound->common.length = ReadLong(ptr);
+    ptr += 4;
+
+    sound->common.priority = ReadShort(ptr);
+    ptr += 2;
+
+    sound->inst.mChar = *ptr++;
+    sound->inst.cChar = *ptr++;
+    sound->inst.mScale = *ptr++;
+    sound->inst.cScale = *ptr++;
+    sound->inst.mAttack = *ptr++;
+    sound->inst.cAttack = *ptr++;
+    sound->inst.mSus = *ptr++;
+    sound->inst.cSus = *ptr++;
+    sound->inst.mWave = *ptr++;
+    sound->inst.cWave = *ptr++;
+    sound->inst.nConn = *ptr++;
+    sound->inst.voice = *ptr++;
+    sound->inst.mode = *ptr++;
+    sound->inst.unused[0] = *ptr++;
+    sound->inst.unused[1] = *ptr++;
+    sound->inst.unused[2] = *ptr++;
+    sound->block = *ptr++;
+
+    fread (sound->data,size - ORIG_ADLIBSOUND_SIZE + 1,1,audiofile);  // + 1 because of byte data[1]
+
+    audiosegs[chunk]=(byte *) sound;
+
+    free (bufferseg);
+}
+
+//===========================================================================
+
+/*
+======================
+=
+= CA_LoadAllSounds
+=
+= Purges all sounds, then loads all new ones (mode switch)
+=
+======================
+*/
+
+void CA_LoadAllSounds (void)
+{
+	xil_printf("[%s:%d] in CA_LoadAllSounds\n\r", __FILE__, __LINE__);
+
+	xil_printf("OFF   !!!!!   Sounds     !!!!    OFFF   !!!!! \n\r");
+	return;
+
+	unsigned start,i;
+
+    if (oldsoundmode != sdm_Off)
+    {
+        switch (oldsoundmode)
+        {
+            case sdm_PC:
+                start = STARTPCSOUNDS;
+                break;
+            case sdm_AdLib:
+                start = STARTADLIBSOUNDS;
+                break;
+        }
+
+        for (i=0;i<NUMSOUNDS;i++,start++)
+            UNCACHEAUDIOCHUNK(start);
+    }
+
+    oldsoundmode = SoundMode;
+
+    switch (SoundMode)
+    {
+        case sdm_Off:
+            start = STARTADLIBSOUNDS;   // needed for priorities...
+            break;
+        case sdm_PC:
+            start = STARTPCSOUNDS;
+            break;
+        case sdm_AdLib:
+            start = STARTADLIBSOUNDS;
+            break;
+    }
+
+    if(start == STARTADLIBSOUNDS)
+    {
+        for (i=0;i<NUMSOUNDS;i++,start++)
+            CA_CacheAdlibSoundChunk(start);
+    }
+    else
+    {
+        for (i=0;i<NUMSOUNDS;i++,start++)
+            CA_CacheAudioChunk(start);
+    }
+}
+
+//===========================================================================
+
+
+/*
+======================
+=
+= CAL_ExpandGrChunk
+=
+= Does whatever is needed with a pointer to a compressed chunk
+=
+======================
+*/
+
+void CAL_ExpandGrChunk (int chunk, int32_t *source)
+{
+    int32_t    expanded;
+
+    if (chunk >= STARTTILE8 && chunk < STARTEXTERNS)
+    {
+        //
+        // expanded sizes of tile8/16/32 are implicit
+        //
+
+#define BLOCK           64
+#define MASKBLOCK       128
+
+        if (chunk<STARTTILE8M)          // tile 8s are all in one chunk!
+            expanded = BLOCK*NUMTILE8;
+        else if (chunk<STARTTILE16)
+            expanded = MASKBLOCK*NUMTILE8M;
+        else if (chunk<STARTTILE16M)    // all other tiles are one/chunk
+            expanded = BLOCK*4;
+        else if (chunk<STARTTILE32)
+            expanded = MASKBLOCK*4;
+        else if (chunk<STARTTILE32M)
+            expanded = BLOCK*16;
+        else
+            expanded = MASKBLOCK*16;
+    }
+    else
+    {
+        //
+        // everything else has an explicit size longword
+        //
+        expanded = *source++;
+    }
+
+    //
+    // allocate final space and decompress it
+    //
+    if((expanded > 0) && (expanded < 14000000) ){
+    	grsegs[chunk] = SafeMalloc(expanded);
+
+    	xil_printf("[%s:%d] in CAL_ExpandGrChunk \n\r", __FILE__, __LINE__);
+    	CAL_HuffExpand((byte *) source, grsegs[chunk], expanded, grhuffman);
+    } else {
+    	xil_printf("[%s:%d] in CAL_ExpandGrChunk. ERROR SafeMalloc(expanded) = %x\n\r", __FILE__, __LINE__, expanded);
+    	xil_printf("[%s:%d]\t\t\t this NEED WORK!!!!\n\r", __FILE__, __LINE__);
+    }
+}
+
+
+/*
+======================
+=
+= CAL_DeplaneGrChunk
+=
+======================
+*/
+
+void CAL_DeplaneGrChunk (int chunk)
+{
+    int     i;
+    int16_t width,height;
+
+    xil_printf("\t\t[%s:%d] in CAL_DeplaneGrChunk ->", __FILE__, __LINE__);
+
+    if (chunk == STARTTILE8)
+    {
+
+    	width = height = 8;
+
+    	xil_printf("chunk == STARTTILE8 NUMTILE8: %d\n\r", __FILE__, __LINE__, NUMTILE8);
+
+        for (i = 0; i < NUMTILE8; i++)
+            VL_DePlaneVGA (grsegs[chunk] + (i * (width * height)),width,height);
+    }
+    else
+    {
+        width = pictable[chunk - STARTPICS].width;
+        height = pictable[chunk - STARTPICS].height;
+
+        xil_printf("chunk != STARTTILE8. call VL_DePlaneVGA\n\r", __FILE__, __LINE__);
+        VL_DePlaneVGA (grsegs[chunk],width,height);
+    }
+}
+
+
+/*
+======================
+=
+= CA_CacheGrChunks
+=
+= Load all graphics chunks into memory
+=
+======================
+*/
+
+void CA_CacheGrChunks (FILE *grfile)
+{
+    int32_t pos,compressed;
+    int32_t *bufferseg;
+    int32_t *source;
+    int     chunk,next;
+    xil_printf("\t\t[%s:%d] in CA_CacheGrChunks for iter from %d to %d\n\r", __FILE__, __LINE__, STRUCTPIC + 1, NUMCHUNKS);
+
+    for (chunk = STRUCTPIC + 1; chunk < NUMCHUNKS; chunk++)
+    {
+        if (grsegs[chunk])
+            continue;                             // already in memory
+
+        //
+        // load the chunk into a buffer
+        //
+        pos = GRFILEPOS(chunk);
+
+        if (pos<0)                              // $FFFFFFFF start is a sparse tile
+            continue;
+
+        next = chunk + 1;
+
+        while (GRFILEPOS(next) == -1)           // skip past any sparse tiles
+            next++;
+
+        compressed = GRFILEPOS(next)-pos;
+
+        fseek (grfile,pos,SEEK_SET);
+
+        bufferseg = SafeMalloc(compressed);
+        source = bufferseg;
+
+        fread (source,compressed,1,grfile);
+
+        xil_printf("\t\t_[%s:%d] call CA_CacheGrChunks %d/%d\n\r", __FILE__, __LINE__, chunk, NUMCHUNKS);
+        //xil_printf("\t\t_ _ current addr in stack %x\n\r", &chunk);
+
+        CAL_ExpandGrChunk (chunk,source);
+
+        if (chunk >= STARTPICS && chunk < STARTEXTERNS)
+            CAL_DeplaneGrChunk (chunk);
+
+        free(bufferseg);
+    }
+}
+
+
+
+//==========================================================================
+
+
+/*
+======================
+=
+= CA_CacheMap
+=
+= WOLF: This is specialized for a 64*64 map size
+=
+======================
+*/
+
+void CA_CacheMap (int mapnum)
+{
+	xil_printf("[%s:%d] in CA_CacheMap", __FILE__, __LINE__);
+    FILE     *file;
+    char     fname[13];
+    int32_t  pos,compressed;
+    int      plane;
+    word     *dest;
+    unsigned size;
+    word     *bufferseg;
+    word     *source;
+#ifdef CARMACIZED
+    word     *buffer2seg;
+    int32_t  expanded;
+#endif
+
+    if (mapheaderseg[mapnum]->width != MAPSIZE || mapheaderseg[mapnum]->height != MAPSIZE)
+        Quit ("CA_CacheMap: Map not %u*%u!",MAPSIZE,MAPSIZE);
+
+    snprintf (fname,sizeof(fname),"%s%s",mfilename,extension);
+
+    //file = fopen(fname,"rb");
+    file = fmemopen(GAMEMAPS_WL6, GAMEMAPS_WL6_SIZE, "rb");
+
+    if (!file)
+        CA_CannotOpen (fname);
+
+//
+// load the planes into the allready allocated buffers
+//
+    size = MAPAREA * sizeof(*dest);
+
+    xil_printf("[%s:%d] for iter plane: %d", __FILE__, __LINE__, MAPPLANES);
+    for (plane = 0; plane<MAPPLANES; plane++)
+    {
+        pos = mapheaderseg[mapnum]->planestart[plane];
+        compressed = mapheaderseg[mapnum]->planelength[plane];
+
+	if (!compressed)
+	    continue;    // empty plane
+
+        dest = mapsegs[plane];
+
+        fseek (file,pos,SEEK_SET);
+
+        bufferseg = SafeMalloc(compressed);
+        source = bufferseg;
+
+        fread (source,compressed,1,file);
+#ifdef CARMACIZED
+        //
+        // unhuffman, then unRLEW
+        // The huffman'd chunk has a two byte expanded length first
+        // The resulting RLEW chunk also does, even though it's not really
+        // needed
+        //
+        expanded = *source;
+        source++;
+        buffer2seg = SafeMalloc(expanded);
+        CAL_CarmackExpand((byte *) source, buffer2seg,expanded);
+        CA_RLEWexpand(buffer2seg+1,dest,size,tinf->RLEWtag);
+        free(buffer2seg);
+
+#else
+        //
+        // unRLEW, skipping expanded length
+        //
+        CA_RLEWexpand (source+1,dest,size,tinf->RLEWtag);
+#endif
+        free(bufferseg);
+    }
+}
+
+//===========================================================================
+
+void CA_CannotOpen (const char *string)
+{
+    Quit ("Can't open %s!",string);
+}

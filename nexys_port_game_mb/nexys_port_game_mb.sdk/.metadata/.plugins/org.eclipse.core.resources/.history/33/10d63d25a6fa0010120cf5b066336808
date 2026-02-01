@@ -1,0 +1,16 @@
+/*
+ * debug_enable_def.h
+ *
+ *  Created on: 25 џэт. 2026 у.
+ *      Author: mihail
+ */
+
+#ifndef SRC_DEBUG_ENABLE_DEF_H_
+#define SRC_DEBUG_ENABLE_DEF_H_
+
+#define XIL_PRINTF_EN 0
+
+#define XIL_PRINTF_TIME_EN 1
+
+
+#endif /* SRC_DEBUG_ENABLE_DEF_H_ */
