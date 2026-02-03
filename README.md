@@ -91,11 +91,11 @@ Step 2: Load and run MicroBlaze application (XSCT Console)
 Controls
 --------------------------------------------------------------------------------
 
-Left / Right arrows   Turn left / right
-Up arrow              Move forward
-Down arrow            Move backward
-Ctrl                  Fire
-Space                 Open doors
+Left / Right arrows   Turn left / right.
+Up arrow              Move forward.
+Down arrow            Move backward.
+Ctrl                  Fire.
+Space                 Open doors.
 
 
 --------------------------------------------------------------------------------
