@@ -64,23 +64,23 @@ Step 2: Load and run MicroBlaze application (XSCT Console)
   After programming the FPGA, open XSCT Console in Vivado SDK and execute
   the following commands sequentially:
 
-  connect
+  connect -
       Connects to the JTAG programmer.
 
-  targets
+  targets -
       Lists available targets. The currently selected target is marked
       with an asterisk (*).
 
-  target 3
+  target 3 -
       Selects target #3 (MicroBlaze core on Nexys A7).
       Run 'targets' again to verify selection — the active target will show
       an asterisk.
 
-  dow C:/full/path/to/executable.elf
+  dow C:/full/path/to/executable.elf -
       Downloads the ELF executable to MicroBlaze memory.
       Note: On Windows use forward slashes (/) instead of backslashes (\).
 
-  con
+  con -
       Starts execution of the loaded program.
 
   Tip: After the first load, you can restart execution with 'stop' followed by
