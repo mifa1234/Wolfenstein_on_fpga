@@ -14,14 +14,17 @@ Port of the classic 1992 game *Wolfenstein 3D* to Xilinx Artix-7 FPGA platform. 
 - **Display:** VGA output (PmodVGA)
 - **Input:** PS/2 keyboard
 
-## SDL Compatibility Layer
+## SDL Port Details
 
-The port uses a minimal shim layer implementing only required SDL API functions:
-- `SDL_GetTicks()` — timer based on MicroBlaze timebase
-- `SDL_PollEvent()` — keyboard input polling from PS/2 controller registers
-- Audio functions (`Mix_*`) — stubbed (no sound output)
+The project uses SDL 1.2 codebase adapted for the MicroBlaze platform. Since the target has no filesystem, all game assets are handled in memory:
 
-This allowed reuse of the original Wolf4SDL codebase with minimal modifications.
+- **Assets embedding:** Maps, textures and sprites are converted to C byte arrays and compiled directly into the executable.
+- **File operations:** Standard `fread`/`fseek`/`fclose` are used at the application level. Instead of `fopen`, asset loading calls `fmemopen()` with a pointer to the corresponding byte array, creating a `FILE*` stream over memory.
+- **Input:** Keyboard state is read from PS/2 controller registers.
+- **Timing:** `SDL_GetTicks()` uses MicroBlaze timebase counter.
+- **Audio:** SDL_mixer functions are linked but produce no output (audio hardware not implemented).
+
+Game logic remains unchanged — only I/O subsystems were adapted to the bare-metal environment.
 
 ## Setup Instructions
 
@@ -46,19 +49,19 @@ Lists available targets. The currently selected target is marked with an asteris
 ```
 target 3
 ```
-Selects target #3 (typically the MicroBlaze core on Nexys A7).  
+Selects target #3 (MicroBlaze core on Nexys A7).  
 Run `targets` again to verify selection — the active target will show an asterisk.
 
 ```
 dow C:/full/path/to/executable.elf
 ```
 Downloads the ELF executable to MicroBlaze memory.  
-⚠️ On Windows: use forward slashes (`/`) in the path instead of backslashes (`\`).
+⚠️ On Windows: use forward slashes (`/`) instead of backslashes (`\`).
 
 ```
 con
 ```
-Starts execution of the loaded program. The game begins rendering to VGA output.
+Starts execution of the loaded program.
 
 > Tip: After the first load, you can restart execution with `stop` followed by `con` without reprogramming the FPGA.
 
@@ -73,10 +76,10 @@ Starts execution of the loaded program. The game begins rendering to VGA output.
 
 ## Legal Notice
 
-This repository **does not include** copyrighted game assets (textures, maps, sounds). You must provide assets from a legally obtained copy of *Wolfenstein 3D* shareware version (v1.4).
+This repository **does not include** copyrighted game assets. You must extract assets from a legally obtained copy of *Wolfenstein 3D* shareware version (v1.4), convert them to C arrays, and embed them into the source before compilation.
 
 ## License
 
 - Hardware description (Vivado project): MIT License
-- Software (ported game logic): Derived from GPL-licensed Wolf4SDL — see LICENSE file
+- Software (adapted Wolf4SDL): Derived from GPL-licensed code — see LICENSE file
 ```
